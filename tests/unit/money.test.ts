@@ -45,5 +45,5 @@ describe("Money", () => {
         expect(a.equals(Money.from({ amount: "5.00", currency: "BRL" }))).toBe(true);
         expect(a.equals(Money.from({ amount: "5.00", currency: "USD" }))).toBe(false);
     });
-    
+
 });
