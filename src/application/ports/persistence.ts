@@ -36,6 +36,17 @@ export interface WalletLedgerRepository {
     insert(entry: WalletLedgerEntry): Promise<void>;
     /** saldo reconstruído pelo ledger — invariante final de todos os testes (§13) */
     calculateBalance(walletId: string, currency: string): Promise<Money>;
+    /**
+     * Página keyset por (createdAt, id) ascendente — cursor estável (§9):
+     * lançamentos novos entram no fim e não deslocam páginas já servidas.
+     */
+    findPage(
+        walletId: string,
+        after: { createdAt: Date; id: string } | null,
+        limit: number,
+    ): Promise<WalletLedgerEntry[]>;
+    /** total de lançamentos (checkedEntries da reconciliação, §9) */
+    countByWallet(walletId: string): Promise<number>;
 }
 
 export interface OutboxRepository {

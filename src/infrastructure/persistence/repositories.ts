@@ -125,6 +125,33 @@ export class MikroOrmWalletLedgerRepository implements WalletLedgerRepository {
             return entry.direction === "CREDIT" ? balance.add(amount) : balance.subtract(amount);
         }, Money.zero(currency));
     }
+
+    async findPage(
+        walletId: string,
+        after: { createdAt: Date; id: string } | null,
+        limit: number,
+    ): Promise<WalletLedgerEntry[]> {
+        // keyset (createdAt, id) ascendente: sem OFFSET — páginas estáveis
+        // mesmo com lançamentos chegando ao fim da tabela (cursor opaco, §9)
+        const where = after
+            ? {
+                wallet: walletId,
+                $or: [
+                    { createdAt: { $gt: after.createdAt } },
+                    { createdAt: after.createdAt, id: { $gt: after.id } },
+                ],
+            }
+            : { wallet: walletId };
+        const entries = await this.em.find(WalletLedgerEntryEntity, where, {
+            orderBy: { createdAt: "asc", id: "asc" },
+            limit,
+        });
+        return entries.map((entry) => WalletLedgerEntryMapper.toDomain(entry));
+    }
+
+    async countByWallet(walletId: string): Promise<number> {
+        return this.em.count(WalletLedgerEntryEntity, { wallet: walletId });
+    }
 }
 
 export class MikroOrmOutboxRepository implements OutboxRepository {

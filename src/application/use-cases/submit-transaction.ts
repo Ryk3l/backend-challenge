@@ -42,6 +42,8 @@ export interface SubmitTransactionResult {
     status: WagerTransactionStatus;
     balance: MoneyProps;
     idempotentReplay: boolean;
+    /** presente quando status = REJECTED — lido pelo provedor para decidir reenvio (§7.2) */
+    failureCode?: FailureCode;
 }
 
 // §8: até 3 retries novos além da primeira tentativa
@@ -261,5 +263,6 @@ function resultOf(transaction: WagerTransaction, idempotentReplay: boolean): Sub
         // saldo observado na transição original — não o saldo atual da wallet (§7)
         balance: (transaction.observedBalance ?? transaction.money).toJSON(),
         idempotentReplay,
+        failureCode: transaction.failureCode,
     };
 }

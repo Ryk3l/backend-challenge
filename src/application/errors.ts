@@ -24,3 +24,11 @@ export class ConcurrencyConflictError extends Error {
         this.name = "ConcurrencyConflictError";
     }
 }
+
+/** Requisição malformada do ponto de vista da aplicação (→ 400) — cursor, limit etc. */
+export class InvalidRequestError extends Error {
+    constructor(public readonly code: string) {
+        super(`Invalid request: ${code}`);
+        this.name = "InvalidRequestError";
+    }
+}

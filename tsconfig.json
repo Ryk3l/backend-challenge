@@ -15,6 +15,10 @@
     "verbatimModuleSyntax": true,
     "noEmit": true,
 
+    // NestJS: decoradores de parâmetro (@Body, @Inject) — o Bun os honra a
+    // partir do tsconfig (sem emitDecoratorMetadata, por isso DI explícita)
+    "experimentalDecorators": true,
+
     // Best practices
     "strict": true,
     "skipLibCheck": true,
