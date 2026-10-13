@@ -3,7 +3,9 @@ import { Money } from "../../domain/money";
 import type { Wallet } from "../../domain/wallet";
 import type { WalletLedgerEntry } from "../../domain/wallet-ledger-entry";
 import type { WagerTransaction } from "../../domain/wager-transaction";
+import { WagerTransactionStatus } from "../../domain/wager-transaction";
 import type { OutboxMessage } from "../../domain/outbox-message";
+import { NotFoundError } from "../../application/errors";
 import type {
     WalletRepository,
     WagerTransactionRepository,
@@ -41,6 +43,17 @@ export class MikroOrmWalletRepository implements WalletRepository {
     async insert(wallet: Wallet): Promise<void> {
         await this.em.persist(WalletMapper.toEntity(wallet));
     }
+
+    async update(wallet: Wallet): Promise<void> {
+        const entity = await this.em.findOne(WalletEntity, { id: wallet.id });
+        if (!entity) throw new NotFoundError("WALLET_NOT_FOUND");
+
+        // version NÃO é copiado de propósito: o domínio já incrementou (N → N+1)
+        // e o ORM usa o valor ANTIGO da entidade gerenciada no WHERE, gerando
+        // `SET version = version + 1` — 0 linhas = conflito otimista (§8)
+        entity.balance = wallet.balance.toString();
+        entity.updatedAt = wallet.updatedAt;
+    }
 }
 
 export class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
@@ -51,10 +64,46 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
         return entity ? WagerTransactionMapper.toDomain(entity) : null;
     }
 
+    async findByIdempotencyKey(idempotencyKey: string): Promise<WagerTransaction | null> {
+        const entity = await this.em.findOne(WagerTransactionEntity, { idempotencyKey });
+        return entity ? WagerTransactionMapper.toDomain(entity) : null;
+    }
+
+    async findByProviderAndExternal(providerId: string, externalTransactionId: string): Promise<WagerTransaction | null> {
+        const entity = await this.em.findOne(WagerTransactionEntity, { providerId, externalTransactionId });
+        return entity ? WagerTransactionMapper.toDomain(entity) : null;
+    }
+
+    async existsReversal(
+        providerId: string,
+        referenceExternalTransactionId: string,
+        kind: WagerTransaction["kind"],
+    ): Promise<boolean> {
+        const count = await this.em.count(WagerTransactionEntity, {
+            providerId,
+            referenceExternalTransactionId,
+            kind,
+            status: WagerTransactionStatus.Processed, // só reversão aplicada vale — rejeitada não congela a referência
+        });
+        return count > 0;
+    }
+
     async insert(transaction: WagerTransaction): Promise<void> {
         // FK wallet_id: reference resolvida pelo próprio UoW na ordenação do flush
         const wallet = this.em.getReference(WalletEntity, transaction.walletId);
         await this.em.persist(WagerTransactionMapper.toEntity(transaction, wallet));
+    }
+
+    async update(transaction: WagerTransaction): Promise<void> {
+        const entity = await this.em.findOne(WagerTransactionEntity, { id: transaction.id });
+        if (!entity) throw new NotFoundError("TRANSACTION_NOT_FOUND");
+
+        entity.status = transaction.status;
+        entity.referenceTransactionId = transaction.referenceTransactionId ?? null;
+        entity.failureCode = transaction.failureCode ?? null;
+        entity.processedAt = transaction.processedAt ?? null;
+        entity.observedBalance = transaction.observedBalance?.toString() ?? null;
+        entity.updatedAt = transaction.processedAt ?? new Date();
     }
 }
 

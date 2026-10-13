@@ -28,9 +28,12 @@ export enum FailureCode {
     REFERENCE_REQUIRED = "REFERENCE_REQUIRED",
     REFERENCE_NOT_FOUND = "REFERENCE_NOT_FOUND",
     REFERENCE_ALREADY_REVERSED = "REFERENCE_ALREADY_REVERSED",
+    REFERENCE_NOT_PROCESSED = "REFERENCE_NOT_PROCESSED",
+    REFERENCE_SCOPE_MISMATCH = "REFERENCE_SCOPE_MISMATCH",
     INVALID_KIND_FOR_REFERENCE = "INVALID_KIND_FOR_REFERENCE",
     AMOUNT_DIFFERS_FROM_REFERENCE = "AMOUNT_DIFFERS_FROM_REFERENCE",
     CURRENCY_MISMATCH = "CURRENCY_MISMATCH",
+    PLAYER_WALLET_MISMATCH = "PLAYER_WALLET_MISMATCH",
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT",
 }
 
@@ -73,6 +76,8 @@ export interface WagerTransactionState extends CreateWagerTransactionProps {
     referenceTransactionId?: string;
     failureCode?: FailureCode;
     processedAt?: Date;
+    /** saldo da wallet observado na transição — base da resposta idempotente */
+    observedBalance?: MoneyProps;
 }
 
 // ---------- entidade ----------
@@ -96,6 +101,7 @@ export class WagerTransaction {
         private _referenceTransactionId?: string,
         private _failureCode?: FailureCode,
         private _processedAt?: Date,
+        private _observedBalance?: Money,
     ) { }
 
     /** Nasce em PENDING. Valida a exigência de referência por kind. */
@@ -128,6 +134,7 @@ export class WagerTransaction {
             state.money, state.referenceExternalTransactionId,
             state.createdAt, state.status, state.referenceTransactionId,
             state.failureCode, state.processedAt,
+            state.observedBalance ? Money.from(state.observedBalance) : undefined,
         );
     }
 
@@ -137,6 +144,7 @@ export class WagerTransaction {
     get referenceTransactionId(): string | undefined { return this._referenceTransactionId; }
     get failureCode(): FailureCode | undefined { return this._failureCode; }
     get processedAt(): Date | undefined { return this._processedAt; }
+    get observedBalance(): Money | undefined { return this._observedBalance; }
 
     // ---------- transições ----------
 
@@ -187,6 +195,41 @@ export class WagerTransaction {
 
     matchesPayload(payloadHash: string): boolean {
         return this.payloadHash === payloadHash;
+    }
+
+    /**
+     * Regras da seção 7 para reverter `reference` (REFUND/ROLLBACK já validados
+     * como exigindo referência). Devolve o failureCode da primeira violação,
+     * ou undefined se a referência é válida. A checagem de "já revertida" é
+     * persistência — o use case consulta o histórico e rejeita antes daqui.
+     */
+    referenceViolation(reference: WagerTransaction): FailureCode | undefined {
+        // só transação aplicada pode ser revertida (PENDING_REFERENCE é
+        // tratado antes, pelo use case, como espera — não é violação)
+        if (reference.status !== WagerTransactionStatus.Processed)
+            return FailureCode.REFERENCE_NOT_PROCESSED;
+        if (this.kind === WagerTransactionKind.Refund
+            && reference.kind !== WagerTransactionKind.Bet)
+            return FailureCode.INVALID_KIND_FOR_REFERENCE;
+        if (this.kind === WagerTransactionKind.Rollback
+            && reference.kind !== WagerTransactionKind.Bet
+            && reference.kind !== WagerTransactionKind.Win
+            && reference.kind !== WagerTransactionKind.Refund)
+            return FailureCode.INVALID_KIND_FOR_REFERENCE;
+        if (this.playerId !== reference.playerId
+            || this.walletId !== reference.walletId
+            || this.roundId !== reference.roundId)
+            return FailureCode.REFERENCE_SCOPE_MISMATCH;
+        if (this.money.currency !== reference.money.currency)
+            return FailureCode.CURRENCY_MISMATCH;
+        if (!this.money.equals(reference.money))
+            return FailureCode.AMOUNT_DIFFERS_FROM_REFERENCE;
+        return undefined;
+    }
+
+    /** saldo da wallet observado na transição — resposta idempotente (§9) */
+    recordObservedBalance(money: Money): void {
+        this._observedBalance = money;
     }
 
     ledgerDirectionFor(reference?: WagerTransaction): LedgerDirection {

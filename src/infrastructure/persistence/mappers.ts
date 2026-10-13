@@ -69,6 +69,9 @@ export class WagerTransactionMapper {
             referenceTransactionId: entity.referenceTransactionId ?? undefined,
             failureCode: (entity.failureCode ?? undefined) as FailureCode | undefined,
             processedAt: entity.processedAt ?? undefined,
+            observedBalance: entity.observedBalance
+                ? { amount: entity.observedBalance, currency: entity.currency }
+                : undefined,
         };
         return WagerTransaction.rehydrate(state);
     }
@@ -94,6 +97,8 @@ export class WagerTransactionMapper {
         entity.failureCode = transaction.failureCode ?? null;
         entity.createdAt = transaction.createdAt;
         entity.processedAt = transaction.processedAt ?? null;
+        // saldo observado: resposta idempotente (§9) — null enquanto não terminal
+        entity.observedBalance = transaction.observedBalance?.toString() ?? null;
         // updated_at é not null no schema e não existe no domínio (§6.3 não prevê):
         // última transição conhecida da transação
         entity.updatedAt = transaction.processedAt ?? transaction.createdAt;

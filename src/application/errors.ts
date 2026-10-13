@@ -16,3 +16,11 @@ export class NotFoundError extends Error {
         this.name = "NotFoundError";
     }
 }
+
+/** Wallet movida por outra transação/instância entre leitura e commit — o use case tenta de novo */
+export class ConcurrencyConflictError extends Error {
+    constructor(options?: { cause?: unknown }) {
+        super("Concurrency conflict on wallet version", options);
+        this.name = "ConcurrencyConflictError";
+    }
+}

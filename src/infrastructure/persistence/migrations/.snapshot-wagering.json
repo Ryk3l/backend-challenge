@@ -484,6 +484,23 @@
           ],
           "mappedType": "enum"
         },
+        "observed_balance": {
+          "name": "observed_balance",
+          "type": "numeric(18,2)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": 18,
+          "scale": 2,
+          "default": null,
+          "comment": null,
+          "collation": null,
+          "enumItems": [],
+          "mappedType": "decimal"
+        },
         "payload_hash": {
           "name": "payload_hash",
           "type": "varchar(64)",

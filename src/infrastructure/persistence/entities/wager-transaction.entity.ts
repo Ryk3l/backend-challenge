@@ -29,6 +29,8 @@ export const WagerTransactionEntitySchema = defineEntity({
         failureCode: p.string().length(64).nullable(),
         createdAt: p.datetime(),
         processedAt: p.datetime().nullable(),
+        // saldo observado na transição terminal — resposta idempotente
+        observedBalance: p.decimal().precision(18).scale(2).nullable(),
         updatedAt: p.datetime(),
     },
 });

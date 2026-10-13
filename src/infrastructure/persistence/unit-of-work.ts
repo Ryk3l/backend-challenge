@@ -1,6 +1,6 @@
 import type { MikroORM } from "@mikro-orm/postgresql";
-import { UniqueConstraintViolationException } from "@mikro-orm/core";
-import { ConflictError } from "../../application/errors";
+import { OptimisticLockError, UniqueConstraintViolationException } from "@mikro-orm/core";
+import { ConflictError, ConcurrencyConflictError } from "../../application/errors";
 import type { PersistenceSession, UnitOfWork } from "../../application/ports/persistence";
 import {
     MikroOrmWalletRepository,
@@ -41,12 +41,16 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
 }
 
 /**
- * UNIQUE violado em corrida (duas criações simultâneas, replay duplicado)
- * vira conflito de negócio — 409 na API. Todo o resto propaga intacto
- * (erros de domínio, falhas de infra).
+ * Erros de infra traduzidos para o vocabulário da aplicação:
+ * - UNIQUE violado em corrida (duas criações simultâneas, replay duplicado)
+ *   → conflito de negócio (409 na API);
+ * - version desatualizado da wallet (§8) → o use case pode tentar de novo.
+ * Todo o resto propaga intacto (erros de domínio, falhas de infra).
  */
 function translate(err: unknown): unknown {
     if (err instanceof UniqueConstraintViolationException)
         return new ConflictError("DUPLICATE_ROW", { cause: err });
+    if (err instanceof OptimisticLockError)
+        return new ConcurrencyConflictError({ cause: err });
     return err;
 }

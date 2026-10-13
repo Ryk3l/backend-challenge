@@ -1,7 +1,7 @@
 import type { Money } from "../../domain/money";
 import type { Wallet } from "../../domain/wallet";
 import type { WalletLedgerEntry } from "../../domain/wallet-ledger-entry";
-import type { WagerTransaction } from "../../domain/wager-transaction";
+import type { WagerTransaction, WagerTransactionKind } from "../../domain/wager-transaction";
 import type { OutboxMessage } from "../../domain/outbox-message";
 
 // Portas de persistência (dependência invertida): a camada de aplicação
@@ -13,11 +13,23 @@ export interface WalletRepository {
     findByPlayerAndCurrency(playerId: string, currency: string): Promise<Wallet | null>;
     /** enfileira para o flush da transação — nada é gravado antes do commit (§11) */
     insert(wallet: Wallet): Promise<void>;
+    /**
+     * Update otimista: a entidade gerenciada vai ao flush com o version
+     * ANTIGO e o ORM executa `SET version = version + 1 WHERE version = <antigo>`.
+     * 0 linhas afetadas → OptimisticLockError → ConcurrencyConflictError → retry.
+     */
+    update(wallet: Wallet): Promise<void>;
 }
 
 export interface WagerTransactionRepository {
     findById(id: string): Promise<WagerTransaction | null>;
+    findByIdempotencyKey(idempotencyKey: string): Promise<WagerTransaction | null>;
+    findByProviderAndExternal(providerId: string, externalTransactionId: string): Promise<WagerTransaction | null>;
+    /** já existe uma transação PROCESSED deste mesmo kind revertendo a referência? (§7) */
+    existsReversal(providerId: string, referenceExternalTransactionId: string, kind: WagerTransactionKind): Promise<boolean>;
     insert(transaction: WagerTransaction): Promise<void>;
+    /** grava a transição de estado + saldo observado (base do replay idempotente, §9) */
+    update(transaction: WagerTransaction): Promise<void>;
 }
 
 export interface WalletLedgerRepository {
