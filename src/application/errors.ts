@@ -1,0 +1,18 @@
+// Erros da camada de aplicação — a camada de interfaces (HTTP) os mapeia
+// para status distintos (seção 9: conflito ≠ rejeição ≠ falha transitória).
+
+/** Conflito: recurso duplicado ou idempotency key com payload divergente (→ 409) */
+export class ConflictError extends Error {
+    constructor(public readonly code: string, options?: { cause?: unknown }) {
+        super(`Conflict: ${code}`, options);
+        this.name = "ConflictError";
+    }
+}
+
+/** Recurso inexistente (→ 404) */
+export class NotFoundError extends Error {
+    constructor(public readonly code: string) {
+        super(`Not found: ${code}`);
+        this.name = "NotFoundError";
+    }
+}
