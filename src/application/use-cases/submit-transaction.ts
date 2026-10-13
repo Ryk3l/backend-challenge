@@ -20,6 +20,8 @@ import {
 import { payloadHash } from "../payload-hash";
 import { ConflictError, NotFoundError, ConcurrencyConflictError } from "../errors";
 import { type PersistenceSession, type UnitOfWork } from "../ports/persistence";
+import type { LoggerPort } from "../ports/observability";
+import type { MetricsPort } from "../ports/metrics";
 
 export interface SubmitTransactionCommand {
     /** header obrigatório (§9) — fonte da verdade da idempotência */
@@ -63,7 +65,13 @@ export const DEFAULT_PENDING_TTL_MS = 10 * 60 * 1000;
  * concorrência otimista com retry limitado sobre a wallet.
  */
 export class SubmitTransaction {
-    constructor(private readonly uow: UnitOfWork) { }
+    constructor(
+        private readonly uow: UnitOfWork,
+        // opcionais para não quebrar testes que instanciam só com o uow;
+        // em produção vêm dos tokens.LOGGER/tokens.METRICS (§12)
+        private readonly logger?: LoggerPort,
+        private readonly metrics?: MetricsPort,
+    ) { }
 
     async execute(command: SubmitTransactionCommand): Promise<SubmitTransactionResult> {
         // OPENING é interno — não pode ser submetido pela API nem pela fila (§6.3)
@@ -73,14 +81,42 @@ export class SubmitTransaction {
         // payloadHash: só campos de negócio — header e transporte ficam fora (§9)
         const hash = payloadHash(businessPayload(command));
 
+        // latência de processamento medida no único ponto que atravessa
+        // HTTP e fila (§12); correlationId vem do request ou é gerado aqui
+        const startedAt = Date.now();
+        const correlationId = command.correlationId ?? randomUUID();
+        try {
+            const result = await this.executeWithRetries(command, hash, correlationId);
+            this.observe(result, command, correlationId, startedAt);
+            return result;
+        } catch (error) {
+            this.metrics?.increment("transactions_total", { status: "ERROR" });
+            this.logger?.error("transaction_failed", {
+                correlationId,
+                walletId: command.walletId,
+                providerId: command.providerId,
+                error: error instanceof Error ? error.name : "unknown",
+            });
+            throw error;
+        }
+    }
+
+    /** retry ≤ 3 de concorrência otimista, com replay do vencedor (§8) */
+    private async executeWithRetries(
+        command: SubmitTransactionCommand,
+        hash: string,
+        correlationId: string,
+    ): Promise<SubmitTransactionResult> {
         for (let attempt = 0; ; attempt++) {
             try {
-                return await this.tryExecute(command, hash);
+                return await this.tryExecute(command, hash, correlationId);
             } catch (error) {
                 // wallet movida por outra instância entre leitura e commit →
                 // reexecuta do zero com leitura fresca (retry ≤ 3, §8)
-                if (error instanceof ConcurrencyConflictError && attempt < MAX_RETRIES)
+                if (error instanceof ConcurrencyConflictError && attempt < MAX_RETRIES) {
+                    this.metrics?.increment("transaction_retries_total", { reason: "optimistic_lock" });
                     continue;
+                }
                 // perdeu a corrida de idempotência: o vencedor já committed,
                 // então devolvemos a resposta dele em vez de um erro
                 if (error instanceof ConflictError && error.code === "DUPLICATE_ROW")
@@ -90,7 +126,33 @@ export class SubmitTransaction {
         }
     }
 
-    private async tryExecute(command: SubmitTransactionCommand, hash: string): Promise<SubmitTransactionResult> {
+    /** métrica por status + log estruturado com os ids do §12 */
+    private observe(
+        result: SubmitTransactionResult,
+        command: SubmitTransactionCommand,
+        correlationId: string,
+        startedAt: number,
+    ): void {
+        this.metrics?.increment("transactions_total", { status: result.status });
+        if (result.idempotentReplay)
+            this.metrics?.increment("transactions_replayed_total");
+        this.metrics?.observe("processing_latency_ms", Date.now() - startedAt, { status: result.status });
+        this.logger?.info("transaction_processed", {
+            correlationId,
+            transactionId: result.transactionId,
+            walletId: command.walletId,
+            providerId: command.providerId,
+            status: result.status,
+            idempotentReplay: result.idempotentReplay,
+            ...(result.failureCode ? { failureCode: result.failureCode } : {}),
+        });
+    }
+
+    private async tryExecute(
+        command: SubmitTransactionCommand,
+        hash: string,
+        correlationId: string,
+    ): Promise<SubmitTransactionResult> {
         return this.uow.run(async (session) => {
             // 0) dedup de reentrega SQS (§10): inbox na MESMA transação dos
             // efeitos — mensagem já vista = o efeito já foi aplicado
@@ -115,7 +177,7 @@ export class SubmitTransaction {
             // 2) wallet — a unidade de concorrência é a walletId (§8)
             const wallet = await session.wallets.findById(command.walletId);
             if (!wallet) throw new NotFoundError("WALLET_NOT_FOUND");
-            const ctx = { correlationId: command.correlationId ?? randomUUID() };
+            const ctx = { correlationId };
 
             // 3) nasce PENDING; create() valida a exigência de referência por kind
             const transaction = WagerTransaction.create({
@@ -233,7 +295,7 @@ export class SubmitTransaction {
     ): Promise<"resolved" | "rejected" | "waiting"> {
         const now = options?.now ?? new Date();
         const ttlMs = options?.ttlMs ?? DEFAULT_PENDING_TTL_MS;
-        return this.uow.run(async (session) => {
+        const outcome = await this.uow.run(async (session) => {
             const transaction = await session.transactions.findById(transactionId);
             // outra instância já resolveu/rejeitou entre a listagem e aqui —
             // o optimistic lock do wallet cobre a corrida de aplicação dupla
@@ -273,6 +335,10 @@ export class SubmitTransaction {
             const result = await this.applyAndFinish(session, transaction, wallet, reference, ctx);
             return result.status === WagerTransactionStatus.Rejected ? "rejected" : "resolved";
         });
+        // worker §7.1: resolved/rejected são desfechos finais; waiting continua
+        // em voo e será reprocessado no próximo tick — contado à parte (§12)
+        this.metrics?.increment("pending_reprocess_total", { outcome });
+        return outcome;
     }
 
     /** rejeição terminal: sem efeito no saldo, sem ledger, auditável (§7) */

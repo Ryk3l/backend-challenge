@@ -1,6 +1,8 @@
 import { NotFoundError } from "../errors";
 import type { MoneyProps } from "../../domain/money";
 import { type UnitOfWork } from "../ports/persistence";
+import type { LoggerPort } from "../ports/observability";
+import type { MetricsPort } from "../ports/metrics";
 
 export interface ReconcileWalletResult {
     walletId: string;
@@ -17,7 +19,11 @@ export interface ReconcileWalletResult {
  * silêncio — é sinalizada na resposta, logada e (§12) contada em métrica.
  */
 export class ReconcileWallet {
-    constructor(private readonly uow: UnitOfWork) { }
+    constructor(
+        private readonly uow: UnitOfWork,
+        private readonly logger: LoggerPort,
+        private readonly metrics: MetricsPort,
+    ) { }
 
     async execute(walletId: string): Promise<ReconcileWalletResult> {
         return this.uow.run(async (session) => {
@@ -30,14 +36,13 @@ export class ReconcileWallet {
             const consistent = difference.isZero();
 
             if (!consistent) {
-                // TODO(§12): rotear por LoggerPort + contador de métrica
-                console.log(JSON.stringify({
-                    level: "error",
-                    event: "reconciliation_divergence",
+                // divergência NUNCA corrigida em silêncio: logada + contada (§12)
+                this.metrics.increment("reconciliation_divergence_total", { walletId });
+                this.logger.error("reconciliation_divergence", {
                     walletId,
                     stored: wallet.balance.toString(),
                     calculated: calculated.toString(),
-                }));
+                });
             }
 
             return {

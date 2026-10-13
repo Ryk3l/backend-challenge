@@ -1,4 +1,4 @@
-import { SQSClient } from "@aws-sdk/client-sqs";
+import { SQSClient, GetQueueUrlCommand } from "@aws-sdk/client-sqs";
 
 // URLs das filas FIFO do desafio no LocalStack (compose, §4) —
 // sobrescrevíveis por env quando o endpoint não for o padrão local
@@ -14,6 +14,15 @@ export const QUEUE_URLS = {
     events: process.env.SQS_EVENTS_QUEUE_URL
         ?? `http://localhost:4566/${LOCAL_ACCOUNT}/wager-events.fifo`,
 };
+
+/**
+ * Checagem de prontidão do SQS (§12 /health/ready): resolve a URL da fila de
+ * entrada pelo nome — leve e idempotente, não consome mensagem. Lança se o
+ * broker estiver inacessível, para o health marcar `sqs: down`.
+ */
+export async function pingSqs(client: SQSClient): Promise<void> {
+    await client.send(new GetQueueUrlCommand({ QueueName: "wager-transactions.fifo" }));
+}
 
 export function createSqsClient(): SQSClient {
     return new SQSClient({

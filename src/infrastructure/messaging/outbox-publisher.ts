@@ -1,5 +1,7 @@
 import { SendMessageCommand, type SQSClient } from "@aws-sdk/client-sqs";
 import type { UnitOfWork } from "../../application/ports/persistence";
+import type { LoggerPort } from "../../application/ports/observability";
+import type { MetricsPort } from "../../application/ports/metrics";
 import { QUEUE_URLS } from "./sqs-client";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -20,6 +22,8 @@ export class OutboxPublisher {
     constructor(
         private readonly client: SQSClient,
         private readonly uow: UnitOfWork,
+        private readonly logger: LoggerPort,
+        private readonly metrics: MetricsPort,
     ) { }
 
     /** um passe de publicação — retorna quantos eventos saíram */
@@ -39,15 +43,18 @@ export class OutboxPublisher {
                 await this.uow.run((session) =>
                     session.outbox.markPublished(message.id, new Date()),
                 );
+                this.metrics.increment("outbox_published_total", { eventType: message.eventType });
+                // lag de publicação (§12): ocorrência → publicação, em milissegundos
+                this.metrics.observe("outbox_lag_ms", Date.now() - message.occurredAt.getTime());
                 published++;
             } catch (error) {
                 // falha de publicação: o claim já agendou o próximo vencimento —
                 // esta ou outra instância tenta de novo na próxima janela
-                console.log(JSON.stringify({
-                    event: "outbox_publish_failed",
+                this.metrics.increment("outbox_publish_failed_total");
+                this.logger.warn("outbox_publish_failed", {
                     eventId: message.id,
                     retryable: true,
-                }));
+                });
             }
         }
         return published;
@@ -60,10 +67,9 @@ export class OutboxPublisher {
             try {
                 if ((await this.publishOnce()) > 0) continue;
             } catch (error) {
-                console.log(JSON.stringify({
-                    event: "outbox_poll_failed",
+                this.logger.error("outbox_poll_failed", {
                     error: error instanceof Error ? error.name : "unknown",
-                }));
+                });
             }
             // re-checa antes de dormir: stop() durante um passe não espera o tick
             if (this.running) await sleep(pollMs);

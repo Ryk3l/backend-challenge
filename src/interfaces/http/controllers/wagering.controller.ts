@@ -42,6 +42,7 @@ export class WageringController {
     @Post()
     async submit(
         @Headers("idempotency-key") idempotencyKey: unknown,
+        @Headers("x-correlation-id") correlationIdHeader: unknown,
         @Body() body: Record<string, unknown>,
         @Res({ passthrough: true }) res: Response,
     ) {
@@ -50,6 +51,11 @@ export class WageringController {
 
         const command: SubmitTransactionCommand = {
             idempotencyKey,
+            // §12: se o provedor não manda, o use case gera — mas se manda,
+            // o mesmo id costura request → log → evento
+            correlationId: typeof correlationIdHeader === "string" && correlationIdHeader.length > 0
+                ? correlationIdHeader
+                : undefined,
             providerId: requireString(body.providerId, "providerId"),
             externalTransactionId: requireString(body.externalTransactionId, "externalTransactionId"),
             playerId: requireString(body.playerId, "playerId"),

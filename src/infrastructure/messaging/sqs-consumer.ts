@@ -12,6 +12,8 @@ import {
 import { InvalidRequestError } from "../../application/errors";
 import { InvalidMoneyError } from "../../domain/money";
 import { InvalidTransactionError, WagerTransactionKind, WagerTransactionStatus } from "../../domain/wager-transaction";
+import type { LoggerPort } from "../../application/ports/observability";
+import type { MetricsPort } from "../../application/ports/metrics";
 import { QUEUE_URLS } from "./sqs-client";
 
 export const CONSUMER_NAME = "wager-transactions-consumer";
@@ -34,6 +36,8 @@ export class WagerTransactionConsumer {
     constructor(
         private readonly client: SQSClient,
         private readonly submitTransaction: SubmitTransaction,
+        private readonly logger: LoggerPort,
+        private readonly metrics: MetricsPort,
     ) { }
 
     /**
@@ -64,6 +68,7 @@ export class WagerTransactionConsumer {
             command = parseCommand(body, messageId);
         } catch {
             // permanente: payload não é recuperável → DLQ para diagnóstico (§10)
+            this.metrics.increment("consumer_dlq_total", { reason: "malformed_message" });
             await this.toDlq(body, messageId, "MALFORMED_MESSAGE");
             await this.ack(message);
             return;
@@ -71,30 +76,33 @@ export class WagerTransactionConsumer {
 
         try {
             const result = await this.submitTransaction.execute(command);
+            this.metrics.increment("consumer_outcomes_total", { status: result.status });
+            if (result.idempotentReplay)
+                this.metrics.increment("consumer_duplicates_total");
             // REJECTED é decisão de negócio, não falha: terminal → ack; o
             // evento WagerTransactionRejected sai pela outbox (§11)
             if (result.status === WagerTransactionStatus.Rejected)
-                console.log(JSON.stringify({
-                    event: "wager_transaction_rejected",
+                this.logger.warn("wager_transaction_rejected", {
                     transactionId: result.transactionId,
                     failureCode: result.failureCode,
-                }));
+                });
             await this.ack(message);
         } catch (error) {
             if (isPermanent(error)) {
                 // não recuperável (ex.: OPENING tentado pela fila) → DLQ + ack
+                this.metrics.increment("consumer_dlq_total", { reason: errorName(error) });
                 await this.toDlq(body, messageId, errorName(error));
                 await this.ack(message);
                 return;
             }
             // transitória (lock esgotado, banco fora): NÃO ack — a mensagem
             // volta após a visibility timeout e o redrive decide a DLQ (§10)
-            console.log(JSON.stringify({
-                event: "message_processing_failed",
+            this.metrics.increment("consumer_retries_total", { error: errorName(error) });
+            this.logger.warn("message_processing_failed", {
                 messageId,
                 retryable: true,
                 error: errorName(error),
-            }));
+            });
         }
     }
 
@@ -125,7 +133,7 @@ export class WagerTransactionConsumer {
             try {
                 await this.processAvailable();
             } catch (error) {
-                console.log(JSON.stringify({ event: "consumer_poll_failed", error: errorName(error) }));
+                this.logger.error("consumer_poll_failed", { error: errorName(error) });
             }
             // re-checa a flag ANTES de dormir: stop() durante o passe em
             // andamento não pode custar um poll inteiro de espera
@@ -167,6 +175,11 @@ function parseCommand(body: string, messageId: string): SubmitTransactionCommand
         referenceExternalTransactionId: typeof data.referenceExternalTransactionId === "string"
             ? data.referenceExternalTransactionId
             : undefined,
+        // §12: se o publicador mandou um correlationId no envelope, seguimos ele;
+        // sem ele, o messageId do SQS é a melhor chave de correlação disponível
+        correlationId: typeof data.correlationId === "string" && data.correlationId.length > 0
+            ? data.correlationId
+            : messageId,
         // dedup de reentrega: inbox persistente por (consumerName, messageId)
         delivery: { messageId, consumerName: CONSUMER_NAME },
     };

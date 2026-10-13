@@ -18,6 +18,8 @@ import { OutboxPublisher } from "../../src/infrastructure/messaging/outbox-publi
 import { ensureQueues } from "../../src/infrastructure/messaging/queues";
 import { createSqsClient, QUEUE_URLS } from "../../src/infrastructure/messaging/sqs-client";
 import { MikroOrmUnitOfWork } from "../../src/infrastructure/persistence/unit-of-work";
+import { StdoutLogger } from "../../src/infrastructure/observability/stdout-logger";
+import { InMemoryMetrics } from "../../src/infrastructure/observability/in-memory-metrics";
 import { WagerTransactionKind, WagerTransactionStatus, FailureCode } from "../../src/domain/wager-transaction";
 import { WagerTransactionEntity } from "../../src/infrastructure/persistence/entities/wager-transaction.entity";
 import { InboxMessageEntity } from "../../src/infrastructure/persistence/entities/inbox-message.entity";
@@ -46,8 +48,10 @@ beforeAll(async () => {
   const uow = new MikroOrmUnitOfWork(orm);
   createWallet = new CreateWallet(uow);
   submit = new SubmitTransaction(uow);
-  consumer = new WagerTransactionConsumer(sqs, submit);
-  publisher = new OutboxPublisher(sqs, uow);
+  const metrics = new InMemoryMetrics();
+  const logger = new StdoutLogger();
+  consumer = new WagerTransactionConsumer(sqs, submit, logger, metrics);
+  publisher = new OutboxPublisher(sqs, uow, logger, metrics);
   reprocessor = new ReprocessPendingReferences(uow, submit);
 });
 

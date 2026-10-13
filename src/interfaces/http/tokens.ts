@@ -4,6 +4,10 @@
 export const MIKRO_ORM = "MIKRO_ORM";
 export const UNIT_OF_WORK = "UNIT_OF_WORK";
 
+// observabilidade (§12)
+export const LOGGER = "LOGGER";
+export const METRICS = "METRICS";
+
 export const CREATE_WALLET = "CREATE_WALLET";
 export const SUBMIT_TRANSACTION = "SUBMIT_TRANSACTION";
 export const GET_WALLET = "GET_WALLET";

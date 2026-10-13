@@ -16,6 +16,10 @@ import { ReprocessPendingReferences } from "../../application/use-cases/reproces
 import { createSqsClient } from "../../infrastructure/messaging/sqs-client";
 import { WagerTransactionConsumer } from "../../infrastructure/messaging/sqs-consumer";
 import { OutboxPublisher } from "../../infrastructure/messaging/outbox-publisher";
+import { StdoutLogger } from "../../infrastructure/observability/stdout-logger";
+import { InMemoryMetrics } from "../../infrastructure/observability/in-memory-metrics";
+import type { LoggerPort } from "../../application/ports/observability";
+import type { MetricsPort } from "../../application/ports/metrics";
 import * as tokens from "./tokens";
 import { HttpErrorFilter } from "./http-error.filter";
 import { WalletsController } from "./controllers/wallets.controller";
@@ -68,9 +72,13 @@ export class WorkersLifecycle implements OnApplicationShutdown {
         OrmShutdown,
         {
             provide: tokens.UNIT_OF_WORK,
-            useFactory: (orm: MikroORM) => new MikroOrmUnitOfWork(orm),
-            inject: [tokens.MIKRO_ORM],
+            useFactory: (orm: MikroORM, metrics: MetricsPort) => new MikroOrmUnitOfWork(orm, metrics),
+            inject: [tokens.MIKRO_ORM, tokens.METRICS],
         },
+        // observabilidade (§12): porta + implementação concreta; a aplicação
+        // só conhece LoggerPort/MetricsPort, nunca o stdout/in-memory
+        { provide: tokens.LOGGER, useFactory: () => new StdoutLogger() },
+        { provide: tokens.METRICS, useFactory: () => new InMemoryMetrics() },
         {
             provide: tokens.CREATE_WALLET,
             useFactory: (uow: UnitOfWork) => new CreateWallet(uow),
@@ -78,8 +86,9 @@ export class WorkersLifecycle implements OnApplicationShutdown {
         },
         {
             provide: tokens.SUBMIT_TRANSACTION,
-            useFactory: (uow: UnitOfWork) => new SubmitTransaction(uow),
-            inject: [tokens.UNIT_OF_WORK],
+            useFactory: (uow: UnitOfWork, logger: LoggerPort, metrics: MetricsPort) =>
+                new SubmitTransaction(uow, logger, metrics),
+            inject: [tokens.UNIT_OF_WORK, tokens.LOGGER, tokens.METRICS],
         },
         {
             provide: tokens.GET_WALLET,
@@ -98,8 +107,9 @@ export class WorkersLifecycle implements OnApplicationShutdown {
         },
         {
             provide: tokens.RECONCILE_WALLET,
-            useFactory: (uow: UnitOfWork) => new ReconcileWallet(uow),
-            inject: [tokens.UNIT_OF_WORK],
+            useFactory: (uow: UnitOfWork, logger: LoggerPort, metrics: MetricsPort) =>
+                new ReconcileWallet(uow, logger, metrics),
+            inject: [tokens.UNIT_OF_WORK, tokens.LOGGER, tokens.METRICS],
         },
         // filtro global: todos os endpoints falam o mesmo vocabulário de erro (§9)
         { provide: APP_FILTER, useClass: HttpErrorFilter },
@@ -108,14 +118,15 @@ export class WorkersLifecycle implements OnApplicationShutdown {
         { provide: tokens.SQS_CLIENT, useFactory: createSqsClient },
         {
             provide: tokens.WAGER_TRANSACTIONS_CONSUMER,
-            useFactory: (client: SQSClient, submit: SubmitTransaction) =>
-                new WagerTransactionConsumer(client, submit),
-            inject: [tokens.SQS_CLIENT, tokens.SUBMIT_TRANSACTION],
+            useFactory: (client: SQSClient, submit: SubmitTransaction, logger: LoggerPort, metrics: MetricsPort) =>
+                new WagerTransactionConsumer(client, submit, logger, metrics),
+            inject: [tokens.SQS_CLIENT, tokens.SUBMIT_TRANSACTION, tokens.LOGGER, tokens.METRICS],
         },
         {
             provide: tokens.OUTBOX_PUBLISHER,
-            useFactory: (client: SQSClient, uow: UnitOfWork) => new OutboxPublisher(client, uow),
-            inject: [tokens.SQS_CLIENT, tokens.UNIT_OF_WORK],
+            useFactory: (client: SQSClient, uow: UnitOfWork, logger: LoggerPort, metrics: MetricsPort) =>
+                new OutboxPublisher(client, uow, logger, metrics),
+            inject: [tokens.SQS_CLIENT, tokens.UNIT_OF_WORK, tokens.LOGGER, tokens.METRICS],
         },
         {
             provide: tokens.REPROCESS_PENDING_REFERENCES,

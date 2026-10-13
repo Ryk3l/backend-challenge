@@ -1,4 +1,4 @@
-import { Catch, HttpException, Injectable } from "@nestjs/common";
+import { Catch, HttpException, Inject, Injectable } from "@nestjs/common";
 import type { ExceptionFilter, ArgumentsHost } from "@nestjs/common";
 import type { Response } from "express";
 import {
@@ -7,11 +7,14 @@ import {
     InvalidRequestError,
     NotFoundError,
 } from "../../application/errors";
+import type { LoggerPort } from "../../application/ports/observability";
+import type { MetricsPort } from "../../application/ports/metrics";
 import { InvalidMoneyError } from "../../domain/money";
 import {
     InvalidTransactionError,
     InvalidTransactionStateError,
 } from "../../domain/wager-transaction";
+import * as tokens from "./tokens";
 
 /**
  * Mapeamento único e consistente de erros → status HTTP (§9):
@@ -28,16 +31,21 @@ import {
 @Catch()
 @Injectable()
 export class HttpErrorFilter implements ExceptionFilter {
+    constructor(
+        @Inject(tokens.LOGGER) private readonly logger: LoggerPort,
+        @Inject(tokens.METRICS) private readonly metrics: MetricsPort,
+    ) { }
+
     catch(exception: unknown, host: ArgumentsHost): void {
         const res = host.switchToHttp().getResponse<Response>();
         const { status, body } = mapException(exception);
+        this.metrics.increment("http_errors_total", { status: String(status) });
         if (status >= 500) {
-            // log estruturado mínimo — LoggerPort completo na fatia de observabilidade (§12)
-            console.log(JSON.stringify({
-                level: "error",
-                event: "unhandled_exception",
+            // nunca vaza stack para o provedor; o log carrega o detalhe (§12)
+            this.logger.error("unhandled_exception", {
+                status,
                 error: exception instanceof Error ? exception.message : String(exception),
-            }));
+            });
         }
         res.status(status).json(body);
     }

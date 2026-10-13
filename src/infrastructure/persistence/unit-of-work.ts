@@ -2,6 +2,7 @@ import type { MikroORM } from "@mikro-orm/postgresql";
 import { OptimisticLockError, UniqueConstraintViolationException } from "@mikro-orm/core";
 import { ConflictError, ConcurrencyConflictError } from "../../application/errors";
 import type { PersistenceSession, UnitOfWork } from "../../application/ports/persistence";
+import type { MetricsPort } from "../../application/ports/metrics";
 import {
     MikroOrmWalletRepository,
     MikroOrmWagerTransactionRepository,
@@ -17,7 +18,12 @@ import {
  * identity map.
  */
 export class MikroOrmUnitOfWork implements UnitOfWork {
-    constructor(private readonly orm: MikroORM) { }
+    constructor(
+        private readonly orm: MikroORM,
+        // opcional para não quebrar testes que instanciam só com o orm;
+        // em produção vem do tokens.METRICS (§12)
+        private readonly metrics?: MetricsPort,
+    ) { }
 
     async run<T>(fn: (session: PersistenceSession) => Promise<T>): Promise<T> {
         const em = this.orm.em.fork();
@@ -37,6 +43,11 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
                 return result;
             });
         } catch (err) {
+            // conflito otimista = outra instância moveu a wallet entre leitura e
+            // commit (§8). Contado aqui (onde nasce) para a métrica §12 cobrir
+            // todas as origens, não só o caminho do submit.
+            if (err instanceof OptimisticLockError)
+                this.metrics?.increment("concurrency_conflicts_total");
             throw translate(err);
         }
     }
