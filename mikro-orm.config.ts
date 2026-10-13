@@ -8,7 +8,7 @@ export default defineConfig({
   entities: ["./src/infrastructure/persistence/entities/*.ts"],
   dbName: "wagering",
   host: "127.0.0.1",
-  port: 5432,
+  port: 5433,
   user: "wager",
   password: "wager",
   migrations: {
