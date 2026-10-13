@@ -10,6 +10,7 @@ import {
     InvalidTransactionError,
 } from "../../domain/wager-transaction";
 import { OutboxMessage } from "../../domain/outbox-message";
+import { InboxMessage } from "../../domain/inbox-message";
 import { WalletBalanceChanged } from "../../domain/events/wallet-balance-changed";
 import {
     WagerTransactionProcessed,
@@ -35,6 +36,11 @@ export interface SubmitTransactionCommand {
     referenceExternalTransactionId?: string;
     /** repasse do correlationId do request (§12) — gerado se ausente */
     correlationId?: string;
+    /**
+     * preenchido quando a entrada veio da fila (§10): habilita o dedup de
+     * reentrega via inbox persistente na MESMA transação dos efeitos
+     */
+    delivery?: { messageId: string; consumerName: string };
 }
 
 export interface SubmitTransactionResult {
@@ -48,6 +54,8 @@ export interface SubmitTransactionResult {
 
 // §8: até 3 retries novos além da primeira tentativa
 const MAX_RETRIES = 3;
+// §7.1: TTL de PENDING_REFERENCE — decisão documentada no ARCHITECTURE
+export const DEFAULT_PENDING_TTL_MS = 10 * 60 * 1000;
 
 /**
  * POST /wagering/transactions (§7, §8, §9): idempotência persistente,
@@ -84,6 +92,22 @@ export class SubmitTransaction {
 
     private async tryExecute(command: SubmitTransactionCommand, hash: string): Promise<SubmitTransactionResult> {
         return this.uow.run(async (session) => {
+            // 0) dedup de reentrega SQS (§10): inbox na MESMA transação dos
+            // efeitos — mensagem já vista = o efeito já foi aplicado
+            if (command.delivery) {
+                const { consumerName, messageId } = command.delivery;
+                if (await session.inbox.exists(consumerName, messageId)) {
+                    const processed = await session.transactions.findByIdempotencyKey(command.idempotencyKey);
+                    // reentrega da mesma mensagem: devolve a resposta original
+                    // em vez de repetir efeito — sem transação é estado corrompido
+                    if (!processed) throw new ConflictError("INBOX_WITHOUT_TRANSACTION");
+                    return replayResult(processed, hash);
+                }
+                await session.inbox.insert(InboxMessage.receive({
+                    messageId, consumerName, payloadHash: hash,
+                }));
+            }
+
             // 1) replay: mesma key + mesmo payload = mesma resposta (§9)
             const existing = await session.transactions.findByIdempotencyKey(command.idempotencyKey);
             if (existing) return replayResult(existing, hash);
@@ -143,43 +167,111 @@ export class SubmitTransaction {
             }
 
             // 6) aplicar efeito — LOSS registra resultado sem mover saldo (§7)
-            let entry: WalletLedgerEntry | undefined;
-            if (transaction.affectsBalance()) {
-                const direction = transaction.ledgerDirectionFor(reference);
-                try {
-                    entry = direction === LedgerDirection.Debit
-                        ? wallet.debit(transaction.money, transaction.id)
-                        : wallet.credit(transaction.money, transaction.id);
-                } catch (error) {
-                    // reversão que ficaria negativa tem failureCode distinto de
-                    // aposta sem saldo — situações operacionalmente diferentes (§7)
-                    if (error instanceof InsufficientBalanceError) {
-                        const code = transaction.kind === WagerTransactionKind.Rollback
-                            ? FailureCode.NEGATIVE_BALANCE_ON_REVERSAL
-                            : FailureCode.INSUFFICIENT_BALANCE;
-                        return this.reject(session, transaction, wallet, code, ctx);
-                    }
-                    throw error;
+            return this.applyAndFinish(session, transaction, wallet, reference, ctx);
+        });
+    }
+
+    /**
+     * Aplica os efeitos financeiros e transiciona para estado terminal —
+     * trecho único compartilhado entre o submit (HTTP/fila) e o worker de
+     * referências fora de ordem (§7.1): regras num lugar só.
+     */
+    private async applyAndFinish(
+        session: PersistenceSession,
+        transaction: WagerTransaction,
+        wallet: Wallet,
+        reference: WagerTransaction | undefined,
+        ctx: { correlationId: string },
+    ): Promise<SubmitTransactionResult> {
+        let entry: WalletLedgerEntry | undefined;
+        if (transaction.affectsBalance()) {
+            const direction = transaction.ledgerDirectionFor(reference);
+            try {
+                entry = direction === LedgerDirection.Debit
+                    ? wallet.debit(transaction.money, transaction.id)
+                    : wallet.credit(transaction.money, transaction.id);
+            } catch (error) {
+                // reversão que ficaria negativa tem failureCode distinto de
+                // aposta sem saldo — situações operacionalmente diferentes (§7)
+                if (error instanceof InsufficientBalanceError) {
+                    const code = transaction.kind === WagerTransactionKind.Rollback
+                        ? FailureCode.NEGATIVE_BALANCE_ON_REVERSAL
+                        : FailureCode.INSUFFICIENT_BALANCE;
+                    return this.reject(session, transaction, wallet, code, ctx);
                 }
-                await session.ledgerEntries.insert(entry);
-                // otimista: WHERE version = <antigo> — conflito vira retry (§8)
-                await session.wallets.update(wallet);
+                throw error;
+            }
+            await session.ledgerEntries.insert(entry);
+            // otimista: WHERE version = <antigo> — conflito vira retry (§8)
+            await session.wallets.update(wallet);
+        }
+
+        transaction.markProcessed(reference?.id, new Date());
+        transaction.recordObservedBalance(wallet.balance);
+        await session.transactions.update(transaction);
+
+        // 7) eventos atômicos com o commit (§11)
+        await session.outbox.insert(
+            OutboxMessage.enqueue(WagerTransactionProcessed.from(transaction, ctx)),
+        );
+        if (entry)
+            await session.outbox.insert(
+                OutboxMessage.enqueue(WalletBalanceChanged.from(wallet, entry, ctx)),
+            );
+
+        return resultOf(transaction, false);
+    }
+
+    /**
+     * §7.1 — worker: tenta resolver uma transação PENDING_REFERENCE.
+     * "resolved" aplicou os efeitos; "rejected" esgotou o TTL ou violou regra;
+     * "waiting" continua aguardando a referência (o worker tenta de novo).
+     */
+    async reprocessPending(
+        transactionId: string,
+        options?: { now?: Date; ttlMs?: number },
+    ): Promise<"resolved" | "rejected" | "waiting"> {
+        const now = options?.now ?? new Date();
+        const ttlMs = options?.ttlMs ?? DEFAULT_PENDING_TTL_MS;
+        return this.uow.run(async (session) => {
+            const transaction = await session.transactions.findById(transactionId);
+            // outra instância já resolveu/rejeitou entre a listagem e aqui —
+            // o optimistic lock do wallet cobre a corrida de aplicação dupla
+            if (!transaction || transaction.status !== WagerTransactionStatus.PendingReference)
+                return "waiting";
+            const wallet = await session.wallets.findById(transaction.walletId);
+            if (!wallet) throw new NotFoundError("WALLET_NOT_FOUND"); // não ocorre: FK
+            const ctx = { correlationId: randomUUID() };
+
+            const reference = await session.transactions.findByProviderAndExternal(
+                transaction.providerId, transaction.referenceExternalTransactionId!,
+            );
+            if (!reference) {
+                if (now.getTime() - transaction.createdAt.getTime() > ttlMs) {
+                    // TTL esgotado → REJECTED + evento (§7.1)
+                    await this.reject(session, transaction, wallet, FailureCode.REFERENCE_NOT_FOUND, ctx);
+                    return "rejected";
+                }
+                return "waiting"; // ainda dentro do TTL — referência pode chegar
+            }
+            if (reference.status === WagerTransactionStatus.PendingReference)
+                return "waiting"; // cadeia de referências ainda em voo
+
+            const violation = transaction.referenceViolation(reference);
+            if (violation) {
+                await this.reject(session, transaction, wallet, violation, ctx);
+                return "rejected";
+            }
+            const alreadyReversed = await session.transactions.existsReversal(
+                transaction.providerId, transaction.referenceExternalTransactionId!, transaction.kind,
+            );
+            if (alreadyReversed) {
+                await this.reject(session, transaction, wallet, FailureCode.REFERENCE_ALREADY_REVERSED, ctx);
+                return "rejected";
             }
 
-            transaction.markProcessed(reference?.id, new Date());
-            transaction.recordObservedBalance(wallet.balance);
-            await session.transactions.update(transaction);
-
-            // 7) eventos atômicos com o commit (§11)
-            await session.outbox.insert(
-                OutboxMessage.enqueue(WagerTransactionProcessed.from(transaction, ctx)),
-            );
-            if (entry)
-                await session.outbox.insert(
-                    OutboxMessage.enqueue(WalletBalanceChanged.from(wallet, entry, ctx)),
-                );
-
-            return resultOf(transaction, false);
+            const result = await this.applyAndFinish(session, transaction, wallet, reference, ctx);
+            return result.status === WagerTransactionStatus.Rejected ? "rejected" : "resolved";
         });
     }
 

@@ -2,6 +2,7 @@ import "reflect-metadata";
 import { Module, Inject, Injectable, type OnApplicationShutdown } from "@nestjs/common";
 import { APP_FILTER } from "@nestjs/core";
 import { MikroORM } from "@mikro-orm/postgresql";
+import { type SQSClient } from "@aws-sdk/client-sqs";
 import ormConfig from "../../../mikro-orm.config";
 import { MikroOrmUnitOfWork } from "../../infrastructure/persistence/unit-of-work";
 import type { UnitOfWork } from "../../application/ports/persistence";
@@ -11,6 +12,10 @@ import { GetWallet } from "../../application/use-cases/get-wallet";
 import { GetWalletLedger } from "../../application/use-cases/get-wallet-ledger";
 import { GetTransaction } from "../../application/use-cases/get-transaction";
 import { ReconcileWallet } from "../../application/use-cases/reconcile-wallet";
+import { ReprocessPendingReferences } from "../../application/use-cases/reprocess-pending-references";
+import { createSqsClient } from "../../infrastructure/messaging/sqs-client";
+import { WagerTransactionConsumer } from "../../infrastructure/messaging/sqs-consumer";
+import { OutboxPublisher } from "../../infrastructure/messaging/outbox-publisher";
 import * as tokens from "./tokens";
 import { HttpErrorFilter } from "./http-error.filter";
 import { WalletsController } from "./controllers/wallets.controller";
@@ -25,6 +30,26 @@ export class OrmShutdown implements OnApplicationShutdown {
 
     async onApplicationShutdown(): Promise<void> {
         await this.orm.close(true);
+    }
+}
+
+/**
+ * SIGTERM (§10): para os workers — cada um conclui o que está em andamento
+ * antes de sair; mensagens não confirmadas voltam para a fila (visibility
+ * timeout) e a outbox pendente fica para a próxima instância.
+ */
+@Injectable()
+export class WorkersLifecycle implements OnApplicationShutdown {
+    constructor(
+        @Inject(tokens.WAGER_TRANSACTIONS_CONSUMER) private readonly consumer: WagerTransactionConsumer,
+        @Inject(tokens.OUTBOX_PUBLISHER) private readonly publisher: OutboxPublisher,
+        @Inject(tokens.REPROCESS_PENDING_REFERENCES) private readonly reprocessor: ReprocessPendingReferences,
+    ) { }
+
+    onApplicationShutdown(): void {
+        this.consumer.stop();
+        this.publisher.stop();
+        this.reprocessor.stop();
     }
 }
 
@@ -78,6 +103,27 @@ export class OrmShutdown implements OnApplicationShutdown {
         },
         // filtro global: todos os endpoints falam o mesmo vocabulário de erro (§9)
         { provide: APP_FILTER, useClass: HttpErrorFilter },
+        // mensageria (§10/§11) — instanciados aqui, iniciados no main.ts;
+        // testes chamam os passes unitários (processAvailable/publishOnce/tick)
+        { provide: tokens.SQS_CLIENT, useFactory: createSqsClient },
+        {
+            provide: tokens.WAGER_TRANSACTIONS_CONSUMER,
+            useFactory: (client: SQSClient, submit: SubmitTransaction) =>
+                new WagerTransactionConsumer(client, submit),
+            inject: [tokens.SQS_CLIENT, tokens.SUBMIT_TRANSACTION],
+        },
+        {
+            provide: tokens.OUTBOX_PUBLISHER,
+            useFactory: (client: SQSClient, uow: UnitOfWork) => new OutboxPublisher(client, uow),
+            inject: [tokens.SQS_CLIENT, tokens.UNIT_OF_WORK],
+        },
+        {
+            provide: tokens.REPROCESS_PENDING_REFERENCES,
+            useFactory: (uow: UnitOfWork, submit: SubmitTransaction) =>
+                new ReprocessPendingReferences(uow, submit),
+            inject: [tokens.UNIT_OF_WORK, tokens.SUBMIT_TRANSACTION],
+        },
+        WorkersLifecycle,
     ],
 })
 export class AppModule { }

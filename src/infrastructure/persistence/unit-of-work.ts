@@ -7,6 +7,7 @@ import {
     MikroOrmWagerTransactionRepository,
     MikroOrmWalletLedgerRepository,
     MikroOrmOutboxRepository,
+    MikroOrmInboxRepository,
 } from "./repositories";
 
 /**
@@ -26,11 +27,12 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
                     wallets: new MikroOrmWalletRepository(txEm),
                     transactions: new MikroOrmWagerTransactionRepository(txEm),
                     ledgerEntries: new MikroOrmWalletLedgerRepository(txEm),
+                    inbox: new MikroOrmInboxRepository(txEm),
                     outbox: new MikroOrmOutboxRepository(txEm),
                 };
                 const result = await fn(session);
                 // flush único antes do COMMIT: wallet + transação + ledger +
-                // outbox confirmam juntos ou não confirmam (§11)
+                // inbox + outbox confirmam juntos ou não confirmam (§11)
                 await txEm.flush();
                 return result;
             });

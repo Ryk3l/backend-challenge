@@ -2,6 +2,7 @@ import type { Money } from "../../domain/money";
 import type { Wallet } from "../../domain/wallet";
 import type { WalletLedgerEntry } from "../../domain/wallet-ledger-entry";
 import type { WagerTransaction, WagerTransactionKind } from "../../domain/wager-transaction";
+import type { InboxMessage } from "../../domain/inbox-message";
 import type { OutboxMessage } from "../../domain/outbox-message";
 
 // Portas de persistência (dependência invertida): a camada de aplicação
@@ -27,6 +28,8 @@ export interface WagerTransactionRepository {
     findByProviderAndExternal(providerId: string, externalTransactionId: string): Promise<WagerTransaction | null>;
     /** já existe uma transação PROCESSED deste mesmo kind revertendo a referência? (§7) */
     existsReversal(providerId: string, referenceExternalTransactionId: string, kind: WagerTransactionKind): Promise<boolean>;
+    /** candidatas do worker de referências fora de ordem — mais antigas primeiro (§7.1) */
+    findPendingReferences(limit: number): Promise<WagerTransaction[]>;
     insert(transaction: WagerTransaction): Promise<void>;
     /** grava a transição de estado + saldo observado (base do replay idempotente, §9) */
     update(transaction: WagerTransaction): Promise<void>;
@@ -51,6 +54,23 @@ export interface WalletLedgerRepository {
 
 export interface OutboxRepository {
     insert(message: OutboxMessage): Promise<void>;
+    /**
+     * Claim concorrente (§11): pendentes com `FOR UPDATE SKIP LOCKED` +
+     * `scheduleRetry` (attempts+1 e backoff) — o lock morre no commit da claim
+     * e o próximo vencimento impede dupla publicação no fluxo normal.
+     */
+    claimDue(now: Date, limit: number): Promise<OutboxMessage[]>;
+    markPublished(id: string, at: Date): Promise<void>;
+}
+
+/**
+ * Dedup persistente do consumidor SQS (§10) — a garantia real é o
+ * UNIQUE (consumer_name, message_id) no schema; o exists é fast-path.
+ */
+export interface InboxRepository {
+    exists(consumerName: string, messageId: string): Promise<boolean>;
+    /** enfileira na MESMA transação dos efeitos (§6.5/§11) */
+    insert(message: InboxMessage): Promise<void>;
 }
 
 /** Repositórios compartilhando o mesmo EntityManager da transação corrente. */
@@ -58,6 +78,7 @@ export interface PersistenceSession {
     wallets: WalletRepository;
     transactions: WagerTransactionRepository;
     ledgerEntries: WalletLedgerRepository;
+    inbox: InboxRepository;
     outbox: OutboxRepository;
 }
 
