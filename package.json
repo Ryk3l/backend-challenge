@@ -7,12 +7,16 @@
     "typecheck": "bun check"
   },
   "devDependencies": {
+    "@mikro-orm/cli": "^7.2.5",
+    "@mikro-orm/migrations": "^7.2.5",
     "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^7"
   },
   "dependencies": {
+    "@mikro-orm/core": "^7.2.5",
+    "@mikro-orm/postgresql": "^7.2.5",
     "decimal.js": "^10.6.0"
   }
 }
